@@ -20,20 +20,31 @@ from PySide6.QtGui import QPainter, QFont, QColor, QImage, QPixmap
 
 from PySide6.QtSvg import QSvgRenderer
 
+from modbus_utils import ModbusFrameParser
+
 # ── SVG 命名空间 ------------------------------------------------------------
 SVG_NS = "http://www.w3.org/2000/svg"
+INKSCAPE_NS = "http://www.inkscape.org/namespaces/inkscape"
+XLINK_NS = "http://www.w3.org/1999/xlink"
+SODIPODI_NS = "http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+
 ET.register_namespace("", SVG_NS)
-ET.register_namespace("inkscape", "http://www.inkscape.org/namespaces/inkscape")
-ET.register_namespace("xlink", "http://www.w3.org/1999/xlink")
-ET.register_namespace("sodipodi", "http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd")
+ET.register_namespace("inkscape", INKSCAPE_NS)
+ET.register_namespace("xlink", XLINK_NS)
+ET.register_namespace("sodipodi", SODIPODI_NS)
 # NOTE: Do NOT register "svg" prefix — it conflicts with the default namespace
 # and causes ElementTree to emit <svg:svg> which QSvgRenderer cannot parse.
+
+
+def _svg_qname(tag_name):
+    """返回 SVG 默认命名空间下的完整 tag 名"""
+    return "{" + SVG_NS + "}" + tag_name
 
 
 def _svg_find(root, element_id):
     """在 SVG ElementTree 中按 id 或 inkscape:label 查找元素"""
     for el in root.iter():
-        if el.get("id") == element_id or el.get("{http://www.inkscape.org/namespaces/inkscape}label") == element_id:
+        if el.get("id") == element_id or el.get("{" + INKSCAPE_NS + "}label") == element_id:
             return el
     return None
 
@@ -45,7 +56,7 @@ def _svg_set_text(root, element_id, new_text):
         return False
     el.text = new_text
     # 同时处理 <tspan> 子元素（如果有）
-    for tspan in el.findall(f"{{{SVG_NS}}}tspan"):
+    for tspan in el.findall(_svg_qname("tspan")):
         tspan.text = new_text
     return True
 
@@ -133,7 +144,7 @@ def _svg_tag_name(el):
 def _svg_href(el):
     return (
         el.get("href")
-        or el.get("{http://www.w3.org/1999/xlink}href")
+        or el.get("{" + XLINK_NS + "}href")
         or ""
     )
 
@@ -243,6 +254,14 @@ VALVE_INDICATORS = {
     "XV-402": (870, 340),
 }
 
+PRESSURE_BINDINGS = {
+    0x03: "value_PT_303",
+    0x04: "value_PT_301",
+    0x05: "value_PT_302",
+    0x06: "value_PT_ethanol_tank",
+    0x07: "value_PT_LOX_tank",
+}
+
 # 默认不显示调试/状态圆点，避免遮挡原始 SVG 版面
 SHOW_VALVE_INDICATORS = False
 
@@ -253,6 +272,7 @@ class HMIPanel(QWidget):
     def __init__(self, serial_manager, parent=None):
         super().__init__(parent)
         self.serial_manager = serial_manager
+        self._modbus_parser = ModbusFrameParser(valid_addrs=range(1, 8), valid_funcs=(0x03, 0x04))
 
         # 加载 SVG 模板
         svg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "HMI.svg")
@@ -283,6 +303,8 @@ class HMIPanel(QWidget):
         self.last_pressure = 0.0
         self.last_temp1 = 0.0
         self.last_temp2 = 0.0
+        self.last_temp3 = 0.0
+        self.last_temp4 = 0.0
         self.last_thrust = 0.0
         self._last_data_time = time.time()
 
@@ -475,49 +497,48 @@ class HMIPanel(QWidget):
 
     def _expand_valve_use(self, tree, use_el, href, fill_color, stroke_color):
         """根据 href 类型展开 <use> 为带色的内联 <g>。"""
-        SVG = SVG_NS
         x = _parse_svg_number(use_el.get("x"))
         y = _parse_svg_number(use_el.get("y"))
         transform = use_el.get("transform", "")
 
-        g = ET.Element(f"{{{SVG}}}g")
+        g = ET.Element(_svg_qname("g"))
         # 保留原始 id / label
         for aname in ("id",):
             if aname in use_el.attrib:
                 g.set(aname, use_el.get(aname))
-        label = use_el.get("{http://www.inkscape.org/namespaces/inkscape}label")
+        label = use_el.get("{" + INKSCAPE_NS + "}label")
         if label:
-            g.set("{http://www.inkscape.org/namespaces/inkscape}label", label)
+            g.set("{" + INKSCAPE_NS + "}label", label)
 
-        inner = ET.SubElement(g, f"{{{SVG}}}g")
+        inner = ET.SubElement(g, _svg_qname("g"))
         if x != 0 or y != 0:
             inner.set("transform", f"translate({x},{y})")
 
         if href in ("#valve", "#elec-valve"):
             # 蝴蝶翅膀
-            path = ET.SubElement(inner, f"{{{SVG}}}path")
+            path = ET.SubElement(inner, _svg_qname("path"))
             path.set("d", "M -15 -10 L 15 10 L 15 -10 L -15 10 Z")
             path.set("fill", fill_color)
             path.set("stroke", stroke_color)
             path.set("stroke-width", "1.5")
             # 中心销
-            circle = ET.SubElement(inner, f"{{{SVG}}}circle")
+            circle = ET.SubElement(inner, _svg_qname("circle"))
             circle.set("cx", "0"); circle.set("cy", "0"); circle.set("r", "3")
             circle.set("fill", stroke_color)
             # T 型执行器（仅 elec-valve）
             if href == "#elec-valve":
-                act = ET.SubElement(inner, f"{{{SVG}}}path")
+                act = ET.SubElement(inner, _svg_qname("path"))
                 act.set("d", "M 0 -2 L 0 -12 M -8 -12 L 8 -12")
                 act.set("stroke", "#888888")
                 act.set("stroke-width", "1.5")
                 act.set("fill", "none")
         elif href == "#check-valve":
-            circle = ET.SubElement(inner, f"{{{SVG}}}circle")
+            circle = ET.SubElement(inner, _svg_qname("circle"))
             circle.set("cx", "0"); circle.set("cy", "0"); circle.set("r", "12")
             circle.set("fill", fill_color)
             circle.set("stroke", stroke_color)
             circle.set("stroke-width", "1.5")
-            arrow = ET.SubElement(inner, f"{{{SVG}}}path")
+            arrow = ET.SubElement(inner, _svg_qname("path"))
             arrow.set("d", "M -8 0 L 6 0 M 6 -5 L 6 5 M 0 -4 L 5 0 L 0 4")
             arrow.set("stroke", stroke_color)
             arrow.set("stroke-width", "1.5")
@@ -591,31 +612,14 @@ class HMIPanel(QWidget):
         if self._dirty:
             self._render()
 
-    # ── 9 通道 Modbus 04 命令采集 (中盛科技模块) -------------------------------
-    # CH0~CH4: 推力 + 4 压力 (4-20mA), CH5~CH8: 4 温度 (K 型热电偶)
-    # 每通道 2 字节有符号整数 x 0.1, 0xFFFF = 断线
-    CHANNEL_MAP = [
-        ("value_ZT_301",          1.0),     # CH0: 推力 ZT-301
-        ("value_PT_301",          1.0),     # CH1: 乙醇入口压力 PT-301
-        ("value_PT_302",          1.0),     # CH2: 液氧入口压力 PT-302
-        ("value_PT_303",          1.0),     # CH3: 燃烧室压力 PT-303
-        ("value_PT_ethanol_tank", 1.0),     # CH4: 乙醇箱压力
-        ("value_TT_301",          1.0),     # CH5: 乙醇入口温度 TT-301 (热电偶)
-        ("value_TT_302",          1.0),     # CH6: 液氧入口温度 TT-302 (热电偶)
-        ("value_TT_303",          1.0),     # CH7: 燃烧室温度 TT-303 (热电偶)
-        ("value_PT_LOX_tank",     1.0),     # CH8: 液氧箱压力
-    ]
-
-    # 读 9 寄存器, 起始地址 0x0000, CRC16=0C30
-    POLL_CMD = 0x010400000009300C
-
     def _on_sensor_data(self, data: bytes):
-        """解析 04 功能码响应: 地址01 + 04 + 字节数(18) + 18字节数据 + CRC"""
-        if len(data) < 23 or data[0] != 0x01 or data[1] != 0x04:
-            return
+        """串口 raw bytes 入口：先拼包和 CRC，再交给 frame 解析"""
+        for frame in self._modbus_parser.feed(data):
+            self._process_sensor_frame(frame)
 
-        byte_count = data[2]
-        if byte_count < 18:
+    def _process_sensor_frame(self, frame: bytes):
+        """处理完整且 CRC 正确的 Modbus frame"""
+        if len(frame) < 7:
             return
 
         self._last_data_time = time.time()
@@ -624,33 +628,57 @@ class HMIPanel(QWidget):
         self.status_label.setStyleSheet("color: #00ff00; background: transparent; font-weight: bold;")
 
         try:
-            for ch, (key, scale) in enumerate(self.CHANNEL_MAP):
-                offset = 3 + ch * 2
-                raw = int.from_bytes(data[offset:offset + 2], 'big', signed=False)
-                if raw == 0xFFFF:
-                    continue
-                val = int.from_bytes(data[offset:offset + 2], 'big', signed=True) * 0.1 * scale
-                self.sensor_values[key] = val
+            addr = frame[0]
+            func = frame[1]
 
-            # 衍生值: 乙醇箱温度取 TT-301
-            tt301 = self.sensor_values.get("value_TT_301", 0.0)
-            self.sensor_values["value_TI_ethanol_tank"] = tt301
+            # 01：推力传感器
+            if addr == 0x01 and func == 0x03 and len(frame) >= 7:
+                raw_thr = int.from_bytes(frame[3:5], "big", signed=True)
+                thrust = raw_thr / 1000.0 * 9.8
+                self.sensor_values["value_ZT_301"] = thrust
 
-            self.last_thrust = self.sensor_values.get("value_ZT_301", 0.0)
-            self.last_temp1 = self.sensor_values.get("value_TT_301", 0.0)
-            self.last_temp2 = self.sensor_values.get("value_TT_302", 0.0)
-            self.last_pressure = self.sensor_values.get("value_PT_301", 0.0)
+            # 02：温度变送器 ADC，4 通道
+            elif addr == 0x02 and func == 0x04 and len(frame) >= 13:
+                def parse_temp(raw_bytes):
+                    raw = int.from_bytes(raw_bytes, "big")
+                    if raw == 0xFFFF:
+                        return 0.0
+                    val = raw & 0x7FFF
+                    return (-val * 0.1) if (raw & 0x8000) else (val * 0.1)
+
+                temp1 = parse_temp(frame[3:5])
+                temp2 = parse_temp(frame[5:7])
+                temp3 = parse_temp(frame[7:9])
+                temp4 = parse_temp(frame[9:11])
+
+                self.last_temp1 = temp1
+                self.last_temp2 = temp2
+                self.last_temp3 = temp3
+                self.last_temp4 = temp4
+
+                self.sensor_values["value_TT_301"] = temp1
+                self.sensor_values["value_TT_302"] = temp2
+                self.sensor_values["value_TT_303"] = temp3
+                self.sensor_values["value_TI_ethanol_tank"] = temp4
+
+            # 03~07：智能压力传感器，直接 RS485 输出
+            elif addr in PRESSURE_BINDINGS and func == 0x03 and len(frame) >= 9:
+                raw_p = int.from_bytes(frame[5:7], "big", signed=True)
+                pressure = raw_p / 100.0
+                self.sensor_values[PRESSURE_BINDINGS[addr]] = pressure
+                self.last_pressure = pressure
 
             self._mark_dirty()
+            
         except Exception as e:
             print(f"[HMI] 传感器数据解析错误: {e}")
 
     def _poll_sensors(self):
-        """发送 04 功能码读取 9 路通道"""
+        """混合架构轮询：不在这里死发命令，轮询由 serial_components.py 统一负责"""
         if not self.serial_manager.is_port2_connected():
             return
         try:
-            self.serial_manager.send_to_port2(self.POLL_CMD.to_bytes(8, 'big'))
+            pass
         except Exception:
             pass
 
@@ -726,6 +754,8 @@ class HMIPanel(QWidget):
     # ── 清理 -----------------------------------------------------------------
     def cleanup(self):
         self.is_collecting = False
+        if hasattr(self, "_modbus_parser"):
+            self._modbus_parser.clear()
         for t in ['_render_timer', '_poll_timer', '_stale_timer']:
             timer = getattr(self, t, None)
             if timer:

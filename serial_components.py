@@ -17,6 +17,8 @@ from datetime import datetime
 
 from openpyxl.workbook import Workbook
 
+from modbus_utils import ModbusFrameParser
+
 def calculate_crc16(data: bytes) -> bytes:
     """计算 Modbus RTU CRC16 校验码"""
     crc = 0xFFFF
@@ -581,10 +583,11 @@ class SerialManager(QObject):
     def send_data(self, data: bytes):
         """兼容性方法：智能路由数据到合适的串口"""
 
-        # 根据命令类型智能选择串口
+        # 01~09 是采集侧站号：推力、温度ADC、03~07智能压力传感器全部走串口2
+        # 其他命令默认走串口1：阀门、点火、火花塞、紧急停止等控制侧设备
         if len(data) > 0:
             command = data[0]
-            if command in (0x01, 0x02, 0x03) and len(data) > 1:
+            if 0x01 <= command <= 0x09 and len(data) > 1:
                 return self.send_to_port2(data)
             return self.send_to_port1(data)
         return False
@@ -662,81 +665,152 @@ class SensorControlDialog(QDialog):
         self.is_tare = False
         self.is_calibrated = False
         self.is_pressure_tare = False
+        self._modbus_parser = ModbusFrameParser(valid_addrs=range(1, 10), valid_funcs=(0x03, 0x04))
+
         # 连接信号
         self.serial_manager.port2_data_received.connect(self.on_data)
 
     def on_data(self, data: bytes):
-        """接收数据，区分推力还是温度还是压力"""
+        """安检员：负责接收、拼包、CRC校验，过滤错误数据"""
         if len(data) == 0 or not self.is_collecting:
             return
-        
+
+        if not hasattr(self, "_modbus_parser"):
+            self._modbus_parser = ModbusFrameParser(valid_addrs=range(1, 10), valid_funcs=(0x03, 0x04))
+
+        for frame in self._modbus_parser.feed(data):
+            self.process_sensor_frame(frame)
+
+    def process_sensor_frame(self, frame: bytes):
+        """处理员：负责解析多个物理节点的数据"""
         current_time = time.time() - self.start_time
+        addr = frame[0]
+        func_code = frame[1]
+        
+        try:
+            # ==========================================
+            # 1. 解析推力传感器 (站号 01, 功能码 03)
+            # ==========================================
+            if addr == 0x01 and func_code == 0x03:
+                raw_thr = int.from_bytes(frame[3:5], 'big', signed=True)
+                thrust = raw_thr / 1000.0 * 9.8 - getattr(self, 'thr_zero', 0.0)
+                self.current_state["thrust"] = thrust
 
-        if data[0] == 0x01:  # 推力传感器地址
-            thrust = int.from_bytes(data[3:5], 'big', signed=True) / 1000.0 * 9.8 - self.thr_zero
+                if thrust > self.thr_max: self.thr_max = thrust
+                self.thrust_current_label.setText(f"实时值: {thrust:.2f} N")
+                self.thrust_max_label.setText(f"最大值: {self.thr_max:.2f} N")
+                
+                self.thr_history.append((current_time, thrust))
+                if len(self.thr_history) > 100: self.thr_history.pop(0)
+                if self.thr_history:
+                    x, y = zip(*self.thr_history)
+                    self.curve.setData(x, y)
+                self.thr_all_data.append((current_time, thrust))
+                
+                # 触发保存对齐数据 (以推力为锚点)
+                pressure_val = getattr(self, 'last_pressure', 0.0)
+                pressure_04 = self.current_state.get("pressure_04", 0.0)
+                pressure_05 = self.current_state.get("pressure_05", 0.0)
+                pressure_06 = self.current_state.get("pressure_06", 0.0)
+                pressure_07 = self.current_state.get("pressure_07", 0.0)
+                
+                temp1_val = getattr(self, 'last_temp1', 0.0)
+                temp2_val = getattr(self, 'last_temp2', 0.0)
+                
+                if not hasattr(self, 'all_samples'):
+                    self.all_samples = []
+                self.all_samples.append((
+                    current_time,
+                    thrust,
+                    pressure_val,  # 03
+                    pressure_04,
+                    pressure_05,
+                    pressure_06,
+                    pressure_07,
+                    temp1_val,
+                    temp2_val
+                ))
 
-            # 存储当前采样点的所有数据（使用 current_time 而不是 t）
-            self.current_sample = {
-                'time': current_time,
-                'thrust': thrust,
-                'pressure': self.last_pressure if hasattr(self, 'last_pressure') else None,
-                'temp1': self.last_temp1 if hasattr(self, 'last_temp1') else None,
-                'temp2': self.last_temp2 if hasattr(self, 'last_temp2') else None
-            }
-            self.samples.append(self.current_sample.copy())
-            
-            # 修正：使用 current_time 而不是 t
-            self.thr_history.append((current_time, thrust))
-            self.thrust_display.setText(f"{thrust:.2f} N")
+            # ==========================================
+            # 2. 解析温度大黑盒 (站号 02, 功能码 04, 4路热电偶)
+            # ==========================================
+            elif addr == 0x02 and func_code == 0x04:
+                def parse_temp(raw_bytes, sensor_name):
+                    raw = int.from_bytes(raw_bytes, 'big')
+                    if raw == 0xFFFF: return 0.0
+                    val = raw & 0x7FFF
+                    return (-val * 0.1) if (raw & 0x8000) else (val * 0.1)
 
-            if len(self.thr_history) > 100:
-                self.thr_history.pop(0)
-            x, y = zip(*self.thr_history)
-            self.curve.setData(x, y)
-            self.thr_all_data.append((current_time, thrust))  # 修正：使用 current_time
+                # 02站：温度变送器 ADC，4通道
+                temp1 = parse_temp(frame[3:5], "TT-301")
+                temp2 = parse_temp(frame[5:7], "TT-302")
+                temp3 = parse_temp(frame[7:9], "TT-303") if len(frame) >= 11 else 0.0
+                temp4 = parse_temp(frame[9:11], "TI_ethanol_tank") if len(frame) >= 13 else 0.0
 
-        elif data[0] == 0x02:  # 温度传感器地址
-            temp1 = int.from_bytes(data[3:5], 'big', signed=True) / 10.0
-            temp2 = int.from_bytes(data[5:7], 'big', signed=True) / 10.0
-            
-            # 保存最后收到的温度值
-            self.last_temp1 = temp1
-            self.last_temp2 = temp2
+                self.current_state["temp1"] = temp1
+                self.current_state["temp2"] = temp2
+                self.current_state["temp_TT_301"] = temp1
+                self.current_state["temp_TT_302"] = temp2
+                self.current_state["temp_TT_303"] = temp3
+                self.current_state["temp_TI_ethanol_tank"] = temp4
 
-            self.time_counter += 1
-            self.temp1_history.append((current_time, temp1))  # 使用 current_time
-            self.temp2_history.append((current_time, temp2))  # 使用 current_time
-            self.temp1_display.setText(f"{temp1:.1f} °C")
-            self.temp2_display.setText(f"{temp2:.1f} °C")
+                self.last_temp1 = temp1
+                self.last_temp2 = temp2
+                self.last_temp3 = temp3
+                self.last_temp4 = temp4
 
-            if len(self.temp1_history) > 100:
-                self.temp1_history.pop(0)
-                self.temp2_history.pop(0)
+                if temp1 > self.temp1_max: self.temp1_max = temp1
+                if temp2 > self.temp2_max: self.temp2_max = temp2
 
-            x1, y1 = zip(*self.temp1_history)
-            x2, y2 = zip(*self.temp2_history)
+                self.temp1_current_label.setText(f"实时值: {temp1:.1f} °C")
+                self.temp1_max_label.setText(f"最大值: {self.temp1_max:.1f} °C")
+                self.temp2_current_label.setText(f"实时值: {temp2:.1f} °C")
+                self.temp2_max_label.setText(f"最大值: {self.temp2_max:.1f} °C")
 
-            self.temp1_curve.setData(x1, y1)
-            self.temp2_curve.setData(x2, y2)
+                self.temp1_history.append((current_time, temp1))
+                self.temp2_history.append((current_time, temp2))
+                if len(self.temp1_history) > 100:
+                    self.temp1_history.pop(0)
+                    self.temp2_history.pop(0)
+                if self.temp1_history and self.temp2_history:
+                    x1, y1 = zip(*self.temp1_history)
+                    x2, y2 = zip(*self.temp2_history)
+                    self.temp1_curve.setData(x1, y1)
+                    self.temp2_curve.setData(x2, y2)
+                self.temp1_all_data.append((current_time, temp1))
+                self.temp2_all_data.append((current_time, temp2))
 
-            self.temp1_all_data.append((current_time, temp1))  # 使用 current_time
-            self.temp2_all_data.append((current_time, temp2))  # 使用 current_time
+            # ==========================================
+            # 3. 解析所有的压力传感器 (站号 03~07, 功能码 03)
+            # ==========================================
+            elif addr in [0x03, 0x04, 0x05, 0x06, 0x07] and func_code == 0x03:
+                # 它们是同款传感器：读取寄存器起始 0003，读2个寄存器，数据位于字节 [5:7]
+                raw_p = int.from_bytes(frame[5:7], 'big', signed=True)
+                pressure = raw_p / 100.0 - self.pressure_zero
+                
+                # 暂时将 03 作为主压力更新 UI 图表 (其它通道数据存入 state 等待后续 UI 升级)
+                if addr == 0x03:
+                    self.current_state["pressure"] = pressure
+                    self.last_pressure = pressure
 
-        #旧压力传感器读取[5:7],新压力传感器读取[3:5]
-        elif data[0] == 0x03:   # 压力传感器地址
-            pressure = int.from_bytes(data[5:7], 'big', signed=True) / 100.0 - self.pressure_zero
-            self.last_pressure = pressure
-            self.pressure_org = int.from_bytes(data[5:7], 'big', signed=True) / 100.0
-            
-            self.time_counter += 1
-            self.pressure_history.append((current_time, pressure))  # 使用 current_time
-            self.pressure_display.setText(f"{pressure:.2f} MPa")
+                    if pressure > self.pressure_max:
+                        self.pressure_max = pressure
 
-            if len(self.pressure_history) > 100:
-                self.pressure_history.pop(0)
-            x, y = zip(*self.pressure_history)
-            self.pressure_curve.setData(x, y)
-            self.pressure_all_data.append((current_time, pressure))  # 使用 current_time
+                    self.pressure_current_label.setText(f"实时值: {pressure:.2f} MPa")
+                    self.pressure_max_label.setText(f"最大值: {self.pressure_max:.2f} MPa")
+
+                    self.pressure_history.append((current_time, pressure))
+                    if len(self.pressure_history) > 100: self.pressure_history.pop(0)
+                    if self.pressure_history:
+                        px, py = zip(*self.pressure_history)
+                        self.pressure_curve.setData(px, py)
+                    self.pressure_all_data.append((current_time, pressure))
+                else:
+                    # 把其他传感器的压力存进内存
+                    self.current_state[f"pressure_{addr:02d}"] = pressure
+
+        except Exception as e:
+            print(f"解析 {addr} 号设备数据报错: {e}")
 
     def init_ui(self):
         # 主布局：上下分割
@@ -1018,7 +1092,7 @@ class SensorControlDialog(QDialog):
         self.setLayout(main_layout)
 
     def on_thrust_open(self):
-        command = 0x010300000002C40B
+        command = 0x010400000009300C
         command_bytes = command.to_bytes(8, byteorder='big')
         if not hasattr(self, 'thrust_timer'):
             self.thrust_timer = QTimer(self)
@@ -1063,7 +1137,7 @@ class SensorControlDialog(QDialog):
 
     def on_temp_open(self):
         """开按钮 - 启动定时发送"""
-        command = 0x02040000000271F8
+        command = 0x010400000009300C
         command_bytes = command.to_bytes(8, byteorder='big')
 
         if not hasattr(self, 'temp_timer'):
@@ -2102,6 +2176,8 @@ class SensorDataDialog(QDialog):  # 改为 QDialog
         self.is_collecting = False
         self.is_tare = False
 
+        self._modbus_parser = ModbusFrameParser(valid_addrs=range(1, 10), valid_funcs=(0x03, 0x04))
+
         # 连接信号
         self.serial_manager.port2_data_received.connect(self.on_data)
 
@@ -2292,8 +2368,8 @@ class SensorDataDialog(QDialog):  # 改为 QDialog
         # 2. 循环检查缓冲区，处理所有完整的帧
         while len(self.serial_buffer) >= 3:
             addr = self.serial_buffer[0]
-            # 检查地址是否为 0x01(推力), 0x02(温度), 或 0x03(压力)
-            if addr not in [0x01, 0x02, 0x03]:
+            # 检查地址是否为合法站号 0x01~0x09
+            if addr not in range(1, 10):
                 self.serial_buffer.pop(0) # 丢弃开头不对的脏数据
                 continue
 
@@ -2320,74 +2396,75 @@ class SensorDataDialog(QDialog):  # 改为 QDialog
             del self.serial_buffer[:expected_len]
 
     def process_sensor_frame(self, frame: bytes):
-        """处理员：负责解析数值、更新UI、绘制图表、同步数据记录"""
+        """处理员：负责解析9通道混合数据"""
         t = time.time() - self.start_time
         addr = frame[0]
         
-        updated = False # 标记是否需要记录一行新的对齐数据
+        if addr != 0x01 or len(frame) < 23:
+            return
 
-        if addr == 0x01:  # 推力传感器
-            thrust = int.from_bytes(frame[3:5], 'big', signed=True) / 1000.0 * 9.8 - self.thr_zero
+        try:
+            # 按照 CC 的映射表强行解析 (存在物理隐患，请务必核实 CH8)
+            # CH0 (推力): [3:5]
+            raw_thr = int.from_bytes(frame[3:5], 'big', signed=True)
+            thrust = raw_thr * 0.1 - getattr(self, 'thr_zero', 0.0)
             self.current_state["thrust"] = thrust
 
-            if thrust > self.thr_max:
-                self.thr_max = thrust
+            # CH1 (压力 PT-301): [5:7] -> UI目前只展示一路压力，暂时取这个
+            raw_p = int.from_bytes(frame[5:7], 'big', signed=True)
+            pressure = raw_p * 0.1 - self.pressure_zero
+            self.current_state["pressure"] = pressure
 
-            self.thrust_current_label.setText(f"实时值: {thrust:.2f} N")
-            self.thrust_max_label.setText(f"最大值: {self.thr_max:.2f} N")
-            
-            # 图表更新
-            self.thr_history.append((t, thrust))
-            display_data = self.thr_history[-500:] if len(self.thr_history) > 500 else self.thr_history
-            x, y = zip(*display_data)
-            self.thrust_curve.setData(x, y)
-            
-            updated = True # 我们以推力为锚点，只要推力更新，就把所有数据存一行
+            # 温度解析
+            def parse_temp(raw_bytes, sensor_name):
+                raw = int.from_bytes(raw_bytes, 'big')
+                if raw == 0xFFFF:
+                    self.serial_manager.error_occurred.emit(f"🚨 警报：{sensor_name} 未接入或线路断开！")
+                    return 0.0
+                val = raw & 0x7FFF
+                return (-val * 0.1) if (raw & 0x8000) else (val * 0.1)
 
-        elif addr == 0x02:  # 温度传感器
-            temp1 = int.from_bytes(frame[3:5], 'big', signed=True) / 10.0
-            temp2 = int.from_bytes(frame[5:7], 'big', signed=True) / 10.0
+            # CH5 (乙醇入口温度 TT-301): [13:15]
+            temp1 = parse_temp(frame[13:15], "温度1")
+            # CH6 (液氧入口温度 TT-302): [15:17]
+            temp2 = parse_temp(frame[15:17], "温度2")
+            
             self.current_state["temp1"] = temp1
             self.current_state["temp2"] = temp2
+            self.last_temp1 = temp1
+            self.last_temp2 = temp2
+            self.last_pressure = pressure
 
+            # 更新最大值
+            if thrust > self.thr_max: self.thr_max = thrust
+            if pressure > self.pressure_max: self.pressure_max = pressure
             if temp1 > self.temp1_max: self.temp1_max = temp1
             if temp2 > self.temp2_max: self.temp2_max = temp2
 
+            self.thrust_current_label.setText(f"实时值: {thrust:.2f} N")
+            self.thrust_max_label.setText(f"最大值: {self.thr_max:.2f} N")
+            self.pressure_current_label.setText(f"实时值: {pressure:.2f} MPa")
+            self.pressure_max_label.setText(f"最大值: {self.pressure_max:.2f} MPa")
             self.temp1_current_label.setText(f"实时值: {temp1:.1f} °C")
             self.temp1_max_label.setText(f"最大值: {self.temp1_max:.1f} °C")
             self.temp2_current_label.setText(f"实时值: {temp2:.1f} °C")
             self.temp2_max_label.setText(f"最大值: {self.temp2_max:.1f} °C")
 
-            # 图表更新
+            # 更新历史数据与图表
+            self.thr_history.append((t, thrust))
+            self.pressure_history.append((t, pressure))
             self.temp1_history.append((t, temp1))
             self.temp2_history.append((t, temp2))
-            display_data1 = self.temp1_history[-500:] if len(self.temp1_history) > 500 else self.temp1_history
-            display_data2 = self.temp2_history[-500:] if len(self.temp2_history) > 500 else self.temp2_history
-            x1, y1 = zip(*display_data1)
-            x2, y2 = zip(*display_data2)
-            self.temp1_curve.setData(x1, y1)
-            self.temp2_curve.setData(x2, y2)
 
-        #旧压力传感器读取的是[5:7]而新压力传感器读取到的是[3:5]
-        elif addr == 0x03:  # 新压力传感器
-            # 根据新协议，返回2字节有效数据，数据固定在 frame[3:5]左闭右开 
-            pressure = int.from_bytes(frame[5:7], 'big', signed=True) / 100.0 - self.pressure_zero
-            self.current_state["pressure"] = pressure
+            for hist, curve in [(self.thr_history, self.thrust_curve),
+                                (self.pressure_history, self.pressure_curve),
+                                (self.temp1_history, self.temp1_curve),
+                                (self.temp2_history, self.temp2_curve)]:
+                display_data = hist[-500:] if len(hist) > 500 else hist
+                if display_data:
+                    x, y = zip(*display_data)
+                    curve.setData(x, y)
 
-            if pressure > self.pressure_max:
-                self.pressure_max = pressure
-
-            self.pressure_current_label.setText(f"实时值: {pressure:.2f} MPa")
-            self.pressure_max_label.setText(f"最大值: {self.pressure_max:.2f} MPa")
-
-            # 图表更新
-            self.pressure_history.append((t, pressure))
-            display_data = self.pressure_history[-500:] if len(self.pressure_history) > 500 else self.pressure_history
-            x, y = zip(*display_data)
-            self.pressure_curve.setData(x, y)
-
-        # 核心对齐逻辑：当推力更新时，把所有传感器的当前值打包成一行存入 all_samples
-        if updated:
             self.all_samples.append((
                 t,
                 self.current_state["thrust"],
@@ -2395,6 +2472,9 @@ class SensorDataDialog(QDialog):  # 改为 QDialog
                 self.current_state["temp1"],
                 self.current_state["temp2"]
             ))
+                
+        except Exception as e:
+            print(f"解析大黑盒数据报错: {e}")
 
     def on_start_collection(self):
         """开始数据采集"""
@@ -2424,24 +2504,29 @@ class SensorDataDialog(QDialog):  # 改为 QDialog
         print("传感器数据采集已停止")
 
     def send_sensor_commands(self):
-        thrust_command = 0x010300000002C40B
-        temp_command = 0x02040000000271F8
-        pressure_command = 0x03030003000235e9  # <--- 旧压力传感器 指令：读 0x0003 寄存器，2个数据
-        #pressure_command =  0x030300040001C429   # <--- 新压力传感器 指令：读 0x0004 寄存器，1个数据
-
-        thrust_bytes = thrust_command.to_bytes(8, byteorder='big')
-        temp_bytes = temp_command.to_bytes(8, byteorder='big')
-        pressure_bytes = pressure_command.to_bytes(8, byteorder='big')
-
-        self.serial_manager.send_data(thrust_bytes)
-        QApplication.processEvents()
-        QThread.msleep(50)
-
-        self.serial_manager.send_data(temp_bytes)
-        QApplication.processEvents()
-        QThread.msleep(50)
-
-        self.serial_manager.send_data(pressure_bytes)
+        """【完全多节点总线架构】轮询所有物理节点"""
+        commands = [
+            # 1. 01站: 推力传感器 (旧版指令: 01 03 00 00 00 02)
+            bytes([0x01, 0x03, 0x00, 0x00, 0x00, 0x02]),
+            
+            # 2. 02站: 中盛温度采集大盒子 (连4个热电偶, 功能码04, 读4个寄存器)
+            bytes([0x02, 0x04, 0x00, 0x00, 0x00, 0x04]),
+            
+            # 3. 03站: 老压力传感器 (旧版指令: 03 03 00 03 00 02)
+            bytes([0x03, 0x03, 0x00, 0x03, 0x00, 0x02]),
+            
+            # 4. 04~07站: 新增的同款压力传感器 (完全抄 03 的作业)
+            bytes([0x04, 0x03, 0x00, 0x03, 0x00, 0x02]),
+            bytes([0x05, 0x03, 0x00, 0x03, 0x00, 0x02]),
+            bytes([0x06, 0x03, 0x00, 0x03, 0x00, 0x02]),
+            bytes([0x07, 0x03, 0x00, 0x03, 0x00, 0x02]),
+        ]
+        
+        for base_cmd in commands:
+            cmd_with_crc = base_cmd + calculate_crc16(base_cmd)
+            self.serial_manager.send_data(cmd_with_crc)
+            QApplication.processEvents()
+            QThread.msleep(30) # 给物理总线留出高阻态切换时间
 
     def on_tare(self):
         """推力去皮"""
@@ -2472,17 +2557,20 @@ class SensorDataDialog(QDialog):  # 改为 QDialog
         ws.title = "传感器数据"
 
         # 写入表头
-        ws.append(['时间(s)', '推力(N)', '压力(MPa)', '温度1(°C)', '温度2(°C)'])
+        ws.append(['时间(s)', '推力(N)', '压力_03(MPa)', '压力_04(MPa)', '压力_05(MPa)', '压力_06(MPa)', '压力_07(MPa)', '温度1(°C)', '温度2(°C)'])
 
         # 2. 写入数据：极其简单！因为 self.all_samples 里的每一项都已经是对齐好的一整行数据
         for sample in self.all_samples:
-            # sample 是一个元组: (时间, 推力, 压力, 温度1, 温度2)
             ws.append([
                 round(sample[0], 3),
                 round(sample[1], 2) if sample[1] is not None else '',
                 round(sample[2], 3) if sample[2] is not None else '',
-                round(sample[3], 2) if sample[3] is not None else '',
-                round(sample[4], 2) if sample[4] is not None else ''
+                round(sample[3], 3) if sample[3] is not None else '',
+                round(sample[4], 3) if sample[4] is not None else '',
+                round(sample[5], 3) if sample[5] is not None else '',
+                round(sample[6], 3) if sample[6] is not None else '',
+                round(sample[7], 2) if sample[7] is not None else '',
+                round(sample[8], 2) if sample[8] is not None else ''
             ])
 
         wb.save(filepath)
